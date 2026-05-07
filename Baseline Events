@@ -1,0 +1,58 @@
+Customer + Event Identification
+
+SELECT
+    e.id                            AS event_id,
+    e.code                          AS event_code,
+    e.name                          AS event_name,
+    e.start_date                    AS event_start,
+    e.end_date                      AS event_end,
+    DATEDIFF(day, e.start_date,
+             e.end_date) + 1        AS event_duration_days,
+    e.event_lag_days,
+    e.warning_days,
+
+    -- Product
+    p.id                            AS product_id,
+    p.code                          AS product_code,
+    p.name                          AS product_name,
+    pc.code                         AS product_class,
+    pg.code                         AS product_group,
+    pf.code                         AS product_family,
+
+    -- Location
+    l.id                            AS location_id,
+    l.code                          AS location_code,
+    l.name                          AS location_name,
+
+    -- Customer
+    c.id                            AS customer_id,
+    c.code                          AS customer_code,
+    c.name                          AS customer_name,
+    seg.name                        AS customer_segment,
+
+    -- Event config
+    eplcx.expected_uplift           AS planned_uplift_total,
+    eplcx.expected_demand           AS planned_demand_total,
+    eplcx.quantity_ordered,
+    eplcx.event_minimum,
+    eplcx.is_recal_uplift
+
+FROM event e
+JOIN event_prod_loc_cust_xref   eplcx  ON eplcx.event_id       = e.id
+                                       AND eplcx.is_deleted     = 0
+JOIN product_location_customer_xref plc ON plc.id              = eplcx.prod_loc_cust_id
+                                       AND plc.is_deleted       = 0
+JOIN product                    p      ON p.id                  = plc.product_id
+JOIN location                   l      ON l.id                  = plc.location_id
+JOIN customer                   c      ON c.id                  = plc.customer_id
+JOIN product_class              pc     ON pc.id                 = p.product_class_id
+JOIN product_group              pg     ON pg.id                 = p.product_primary_group_id
+JOIN product_family             pf     ON pf.id                 = p.product_family_id
+JOIN segment                    seg    ON seg.id                = c.segment_id
+WHERE e.id          = 41
+  AND e.is_deleted  = 0
+ORDER BY p.code, l.code, c.code
+
+
+
+select * from event
