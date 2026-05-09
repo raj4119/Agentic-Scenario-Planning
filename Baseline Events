@@ -161,3 +161,71 @@ WHERE dp.period_start <= e.end_date
   AND unpvt.demand_value IS NOT NULL
 
 ORDER BY uplift_source, period_start
+
+
+
+-- OOS + Overstock + Service Levels
+-- Source: product_location_xref_history 
+-- Returns one row per change record within the full event window
+
+SELECT
+    plc.product_id,
+    plc.location_id,
+    h.StartTime                     AS snapshot_from,
+    h.EndTime                       AS snapshot_to,
+
+    CASE
+        WHEN h.StartTime < e.start_date THEN 'pre'
+        WHEN h.StartTime > e.end_date   THEN 'post'
+        ELSE 'during'
+    END                             AS promo_window,
+
+    -- Inventory position
+    h.inventory_BOH,
+    h.inventory_onorder,
+    h.inventory_backorder,          -- unfulfilled demand (OOS signal)
+    h.inventory_reserved,
+    h.total_on_hold_quantity,
+    h.inventory_BOH
+        - ISNULL(h.inventory_reserved, 0)
+        + ISNULL(h.inventory_onorder, 0)  AS available_to_promise,
+
+    -- Safety stock
+    h.safety_stock_units,
+    h.system_safety_stock_units,
+    h.buy_safety_stock_units,
+    h.safety_stock_in_effect,
+
+    -- OOS metrics
+    h.out_of_stock_point,
+    h.out_of_stock_days,
+    CASE
+        WHEN h.inventory_BOH <= h.out_of_stock_point THEN 1
+        ELSE 0
+    END                             AS is_oos_flag,
+
+    -- Overstock metrics
+    h.overstock_units,
+    h.overstock_amount,
+    CASE
+        WHEN h.overstock_units > 0 THEN 1
+        ELSE 0
+    END                             AS is_overstock_flag,
+
+    -- Service level targets at that point in time
+    h.fill_rate_goal,
+    h.fill_rate_goal_el,            -- entity-level override
+    h.service_level_objective,
+
+    -- Lead time at that point in time
+    h.lead_time_days
+
+FROM dbo.product_location_xref_history h
+JOIN event_prod_loc_cust_xref eplcx ON eplcx.event_id = 41
+JOIN product_location_customer_xref plc ON plc.id     = eplcx.prod_loc_cust_id
+JOIN event e ON e.id                                  = 41
+  AND h.location_id = plc.location_id
+  -- Full window: 8 weeks pre to 6 weeks post
+  AND h.EndTime     >= DATEADD(week, -8, e.start_date)
+  AND h.StartTime   <= DATEADD(week,  6, e.end_date)
+ORDER BY h.StartTime
