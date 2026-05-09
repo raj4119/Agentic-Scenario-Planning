@@ -1,1 +1,1069 @@
+# CASCI — Platform Architecture
+## LangGraph + Knowledge Graph + MCP
+
+**Version:** 1.0
+**Status:** POC #1 Active Design
+**Last Updated:** 2026-05-02
+**Audience:** Engineering, Data Science, Architecture Review
+**Related Docs:** [PRD](PRD.md) · [Production Readiness](PRODUCTION_READINESS.md)
+
+---
+
+## Table of Contents
+
+1. [Platform Architecture Overview](#1-platform-architecture-overview)
+2. [Layer 1: Orchestration — LangGraph](#2-layer-1-orchestration--langgraph)
+3. [Layer 2: Tool Connectivity — MCP](#3-layer-2-tool-connectivity--mcp)
+4. [Layer 3: Knowledge Graph — Neo4j](#4-layer-3-knowledge-graph--neo4j)
+5. [Memory System Architecture](#5-memory-system-architecture)
+6. [POC #1: Scenario Planning Reference Implementation](#6-poc-1-scenario-planning-reference-implementation)
+   - 6.1 [Shared State Schema](#61-shared-state-schema)
+   - 6.2 [Agent Definitions](#62-agent-definitions)
+   - 6.3 [LangGraph Graph Definition](#63-langgraph-graph-definition)
+   - 6.4 [Data Flow Diagram](#64-data-flow-diagram)
+   - 6.5 [Tool Registry (POC #1)](#65-tool-registry-poc-1)
+   - 6.6 [Prompt Engineering Strategy](#66-prompt-engineering-strategy)
+7. [KG Integration: Phase 3 Upgrades](#7-kg-integration-phase-3-upgrades)
+8. [Adding a New CASCI Use Case](#8-adding-a-new-casci-use-case)
+9. [Technology Stack](#9-technology-stack)
+10. [File Structure](#10-file-structure)
+11. [Key Design Decisions](#11-key-design-decisions)
+12. [Evaluation Strategy](#12-evaluation-strategy)
+
+---
+
+## 1. Platform Architecture Overview
+
+CASCI is a three-layer architecture. Each layer has a distinct responsibility and can evolve independently:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 1: ORCHESTRATION — LangGraph                             │
+│                                                                 │
+│  Controls: agent steps, branching, loops, state, checkpoints    │
+│                                                                 │
+│  [Orchestrator] → [Agent A] ─┐                                  │
+│                  [Agent B] ─┤→ [Synthesizer] → [Output]         │
+│                              │                                  │
+│  "What to do and in what order"                                 │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │ every agent call goes through
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 2: TOOL CONNECTIVITY — MCP                               │
+│                                                                 │
+│  Standardized interface to all external data and tools          │
+│  Every data source, algorithm, and API is an MCP tool           │
+│                                                                 │
+│  [SQL tools]  [KG tools]  [Algorithm tools]  [API tools]        │
+│                                                                 │
+│  "How to connect to things"                                     │
+└───────────┬──────────────────────────────────┬──────────────────┘
+            │                                  │
+            ▼                                  ▼
+┌─────────────────────┐             ┌──────────────────────┐
+│  RELATIONAL DB      │             │  KNOWLEDGE GRAPH     │
+│  (SQL Server)       │             │  (Neo4j)             │
+│                     │             │                      │
+│  Quantities         │             │  Relationships       │
+│  Time-series data   │             │  Entity graph        │
+│  Costs, policies    │             │  Multi-hop traversal │
+│  Orders, inventory  │             │  Substitution chains │
+│                     │             │                      │
+│  "How much"         │             │  "What connects"     │
+└─────────────────────┘             └──────────────────────┘
+```
+
+### Why Three Layers?
+
+**Why LangGraph and not just an LLM making decisions?**
+LangGraph provides deterministic control flow. An LLM deciding its own next steps (ReAct pattern) is fine for simple tasks but brittle for production supply chain workflows where you need guaranteed parallel execution, human checkpoints at specific points, retry logic, and state that persists across steps. LangGraph gives you all of this with auditable, testable agent behavior.
+
+**Why MCP and not direct DB connections in agents?**
+MCP standardizes the interface between agents and tools. When you add a new use case, it calls the same tool registry — it doesn't need to know whether the data comes from SQL Server, Neo4j, or an external API. This is the "composable" in CASCI. Adding a new data source means adding one MCP tool registration, not modifying every agent.
+
+**Why a Knowledge Graph and not just SQL?**
+SQL is optimized for answering "how much" (inventory levels, quantities, costs). The Knowledge Graph is optimized for answering "what connects to what" (supplier → product → location → customer chains). A 5-hop join in SQL across millions of rows is extremely slow and fragile. The same query in Cypher (Neo4j's query language) is fast and natural. The KG unlocks multi-hop scenario reasoning that is impractical in pure SQL.
+
+**SQL still owns:** demand history, inventory positions, order quantities, costs, financial figures.
+**KG owns:** product substitution chains, supplier-product-location-customer entity graph, shared supplier raw materials.
+**They never overlap** — each tool queries the right database for its question type.
+
+---
+
+## 2. Layer 1: Orchestration — LangGraph
+
+LangGraph models each agent workflow as a **directed state graph**:
+- **Nodes** = agent steps (functions that read/write shared state)
+- **Edges** = transitions between steps (can be conditional)
+- **State** = a TypedDict that all nodes share; agents communicate only through this state, never directly
+
+Key LangGraph capabilities used in CASCI:
+
+| Capability | How CASCI uses it |
+|-----------|------------------|
+| Parallel node execution | Demand Decomposition + Supply Constraint run simultaneously |
+| Conditional routing | Low-confidence path, constrained path, error path each route differently |
+| Human-in-the-loop checkpoints | `interrupt()` pauses graph and waits for planner approval before write-back |
+| State persistence | Full pipeline state is serializable and recoverable if an agent fails mid-run |
+| Native LangSmith integration | Every graph run is automatically traced with agent inputs, outputs, tool calls, and latency |
+
+### Agent Communication Pattern
+
+Agents in CASCI communicate **exclusively through shared state**. No agent calls another agent directly. This makes the system:
+- **Testable:** Each agent can be tested in isolation by constructing the state it expects to read
+- **Observable:** The full state at any point in the pipeline is inspectable
+- **Recoverable:** If an agent fails mid-pipeline, the state can be inspected and the pipeline resumed
+
+---
+
+## 3. Layer 2: Tool Connectivity — MCP
+
+**"Everything is an MCP tool."** This is the core CASCI platform principle.
+
+Every data source and algorithm in CASCI is exposed as an MCP tool with a standardized signature:
+- **Input:** typed parameters
+- **Output:** typed return value
+- **Error:** structured error that agents can handle gracefully
+
+### MCP Tool Categories
+
+```
+casci-platform/
+└── mcp_tools/
+    ├── sql_tools/           SQL Server (TenantDB) queries — read-only
+    │   ├── demand_tools     get_baseline_demand, find_similar_events
+    │   ├── supply_tools     get_inventory_position, get_sourcing_constraints
+    │   └── financial_tools  get_unit_cost, get_carrying_cost_rate
+    │
+    ├── graph_tools/         Neo4j queries — Phase 3
+    │   ├── product_tools    get_product_substitutes (KG), get_product_graph
+    │   ├── supplier_tools   find_alternate_suppliers, get_supplier_network
+    │   └── impact_tools     get_customers_affected_by_supplier
+    │
+    ├── algorithm_tools/     Blue Ridge algorithm wrappers
+    │   ├── cosa_tool        calculate_cosa (existing Blue Ridge logic)
+    │   └── forecast_tool    get_demand_forecast (existing forecast engine)
+    │
+    └── api_tools/           External API calls
+        └── writeback_tool   update_blue_ridge_policy (gated by human approval)
+```
+
+### Tool Registration Pattern
+
+```python
+# casci_platform/mcp_tools/sql_tools/demand_tools.py
+
+from casci_platform.mcp import mcp_tool
+from casci_platform.db import tenantdb_connection
+
+@mcp_tool(
+    name="get_baseline_demand",
+    description="Returns trailing-N-week average weekly demand for a SKU, excluding promotional periods",
+    read_only=True,
+    data_source="TenantDB.demand_history"
+)
+def get_baseline_demand(sku_id: str, weeks: int = 52) -> dict:
+    """
+    Returns: {weekly_demand: List[float], average: float, stddev: float, seasonality_index: float}
+    Excludes weeks overlapping with known promotional events.
+    """
+    conn = tenantdb_connection()
+    # ... SQL query ...
+    return result
+```
+
+The `@mcp_tool` decorator registers the function in the platform tool registry. Any agent in any use case can call it. The agent doesn't know whether the tool hits SQL, Neo4j, or an external API.
+
+---
+
+## 4. Layer 3: Knowledge Graph — Neo4j
+
+### Supply Chain Ontology
+
+The Knowledge Graph models the supply chain as an entity-relationship graph. This is derived directly from the TenantDB schema — the relationships already exist as foreign keys; the KG makes them traversable at graph speed.
+
+```
+Entity Nodes:
+(:Product   {sku_id, product_class, product_group, unit_cost})
+(:Supplier  {supplier_id, lead_time_days, country, status, risk_score})
+(:Location  {location_id, dc_type, region, capacity_units})
+(:Customer  {customer_id, customer_group, segment_tier, priority})
+(:RawMaterial {material_id, name, category})
+
+Relationship Edges:
+(:Supplier)-[:SUPPLIES    {lead_time_weeks, fill_rate, since_date}]->(:Product)
+(:Product) -[:STORED_AT   {safety_stock, reorder_point}]->(:Location)
+(:Location)-[:SERVES      {service_level_target}]->(:Customer)
+(:Product) -[:SUBSTITUTES_FOR {cannibalization_weight: 0.30}]->(:Product)
+(:Supplier)-[:USES        ]->(:RawMaterial)
+(:Supplier)-[:SHARES_MATERIAL_WITH {material_id}]->(:Supplier)
+```
+
+### KG ETL from TenantDB
+
+The KG is populated via an ETL pipeline that reads from TenantDB and writes to Neo4j. This runs on a configurable schedule (daily full reload for POC; incremental CDC for production).
+
+```python
+# casci_platform/etl/kg_etl.py
+
+def sync_product_relationships(sql_conn, neo4j_driver):
+    """
+    Load product substitution edges from product hierarchy.
+    Two products in the same product_class = substitutes; weight derived from hierarchy proximity.
+    """
+    rows = sql_conn.execute("""
+        SELECT p1.sku_id AS sku_a, p2.sku_id AS sku_b,
+               CASE 
+                 WHEN p1.product_class = p2.product_class THEN 0.30
+                 WHEN p1.product_group = p2.product_group THEN 0.10
+                 ELSE 0.0
+               END AS cannibalization_weight
+        FROM product p1
+        JOIN product p2 
+          ON p1.product_group = p2.product_group 
+         AND p1.sku_id <> p2.sku_id
+    """).fetchall()
+
+    with neo4j_driver.session() as session:
+        for row in rows:
+            session.run("""
+                MERGE (a:Product {sku_id: $sku_a})
+                MERGE (b:Product {sku_id: $sku_b})
+                MERGE (a)-[r:SUBSTITUTES_FOR]->(b)
+                SET r.cannibalization_weight = $weight
+            """, sku_a=row.sku_a, sku_b=row.sku_b, weight=row.cannibalization_weight)
+
+def sync_supplier_product_network(sql_conn, neo4j_driver):
+    """
+    Load Supplier → Product edges from PSN (product sourcing network).
+    """
+    rows = sql_conn.execute("""
+        SELECT s.id AS supplier_id, p.sku_id,
+               sn.default_lead_time_days / 7.0 AS lead_time_weeks,
+               sn.default_order_cycle_days
+        FROM psn psn
+        JOIN supplier s ON psn.supplier_id = s.id
+        JOIN product p ON psn.product_id = p.id
+        JOIN sourcing_network sn ON psn.sourcing_network_id = sn.id
+        WHERE psn.is_deleted = 0
+    """).fetchall()
+
+    with neo4j_driver.session() as session:
+        for row in rows:
+            session.run("""
+                MERGE (s:Supplier {supplier_id: $supplier_id})
+                MERGE (p:Product {sku_id: $sku_id})
+                MERGE (s)-[r:SUPPLIES]->(p)
+                SET r.lead_time_weeks = $lead_time_weeks
+            """, **dict(row))
+
+def sync_product_location_customer(sql_conn, neo4j_driver):
+    """
+    Load Product → Location and Location → Customer edges.
+    """
+    # Product → Location (from product_location table)
+    pl_rows = sql_conn.execute("""
+        SELECT pl.sku_id, pl.location_id, 
+               pl.safety_stock, pl.reorder_point
+        FROM product_location pl
+        WHERE pl.is_deleted = 0
+    """).fetchall()
+
+    # Location → Customer (from customer_location or order data)
+    lc_rows = sql_conn.execute("""
+        SELECT DISTINCT o.location_id, o.customer_id,
+               c.customer_group, c.segment_tier
+        FROM [order] o
+        JOIN customer c ON o.customer_id = c.id
+        WHERE o.order_status_id = 2  -- pending_delivery
+    """).fetchall()
+
+    with neo4j_driver.session() as session:
+        for row in pl_rows:
+            session.run("""
+                MERGE (p:Product {sku_id: $sku_id})
+                MERGE (l:Location {location_id: $location_id})
+                MERGE (p)-[r:STORED_AT]->(l)
+                SET r.safety_stock = $safety_stock, r.reorder_point = $reorder_point
+            """, **dict(row))
+
+        for row in lc_rows:
+            session.run("""
+                MERGE (l:Location {location_id: $location_id})
+                MERGE (c:Customer {customer_id: $customer_id})
+                SET c.customer_group = $customer_group, c.segment_tier = $segment_tier
+                MERGE (l)-[:SERVES]->(c)
+            """, **dict(row))
+```
+
+### KG Queries (Cypher)
+
+The power of the KG is the traversal queries. These are wrapped as MCP tools in Phase 3:
+
+```cypher
+-- "Which customers are affected if Supplier X fails?" (5-hop traversal)
+MATCH (s:Supplier {supplier_id: $supplier_id})
+      -[:SUPPLIES]->(p:Product)
+      -[:STORED_AT]->(l:Location)
+      -[:SERVES]->(c:Customer)
+RETURN c.customer_id, c.segment_tier, p.sku_id, l.location_id
+ORDER BY c.segment_tier ASC
+
+-- "Find substitute products with their cannibalization weight" (weighted traversal)
+MATCH (source:Product {sku_id: $sku_id})
+      -[r:SUBSTITUTES_FOR*1..2]->(sub:Product)
+RETURN sub.sku_id,
+       reduce(w=1.0, rel IN r | w * rel.cannibalization_weight) AS total_weight,
+       length(r) AS hops
+ORDER BY total_weight DESC
+
+-- "Find alternate suppliers for a product, excluding a specific supplier"
+MATCH (s:Supplier)-[r:SUPPLIES]->(p:Product {sku_id: $sku_id})
+WHERE s.supplier_id <> $excluded_supplier_id
+  AND s.status = 'active'
+RETURN s.supplier_id, r.lead_time_weeks, s.country, r.fill_rate
+ORDER BY r.lead_time_weeks ASC
+
+-- "Which suppliers share a raw material (supply chain contagion risk)?"
+MATCH (s1:Supplier {supplier_id: $supplier_id})
+      -[:SHARES_MATERIAL_WITH]->(s2:Supplier)
+      -[:SUPPLIES]->(p:Product)
+RETURN s2.supplier_id, p.sku_id, p.product_class
+```
+
+---
+
+## 5. Memory System Architecture
+
+CASCI's memory system is layered. Each layer is implemented as a separate component and loaded into the agent's context before the LLM call via the **Prompt Assembly Pipeline**:
+
+```
+User query / system trigger
+        ↓
+1. INTENT RESOLVER        — What is the agent trying to do?
+        ↓
+2. CONSTRAINT INJECTOR    — Load L1 (Instruction Memory) rules
+        ↓
+3. MEMORY SELECTOR        — Query L2, L3, L4, L6 for relevant context
+        ↓
+4. STATE COMPILER         — Current DB state (live data from MCP tools)
+        ↓
+5. RISK POSTURE ENGINE    — What autonomy level applies? What approvals needed?
+        ↓
+LLM receives fully-assembled context prompt
+        ↓
+Agent response + action
+```
+
+### Memory Layer Implementation Plan
+
+| Layer | Implementation | Storage | Built In |
+|-------|---------------|---------|----------|
+| L1 Instruction | `enterprise_settings` table fields injected at agent init | TenantDB | POC #1 |
+| L2 Short-Term | `ScenarioPlanningState` TypedDict (LangGraph state) | In-memory | POC #1 |
+| L3 Episodic | `agent_decision_log` table in AuditDB | SQL Server | Phase 2 |
+| L4 Profile | `user_preferences` + `tenant_settings` tables | SQL Server | Phase 2 |
+| L5 Graph | Neo4j entity-relationship graph | Neo4j | Phase 3 |
+| L6 Semantic | Existing RAG vector store (already operational) | Pinecone/pgvector | POC #1 (existing) |
+
+---
+
+## 6. POC #1: Scenario Planning Reference Implementation
+
+This section is the complete engineering specification for CASCI POC #1. It uses SQL for all data access (no KG yet). KG upgrades are documented in [Section 7](#7-kg-integration-phase-3-upgrades).
+
+### 6.1 Shared State Schema
+
+All agents read from and write to a single `ScenarioPlanningState`. No agent stores private state. The full pipeline state is observable, serializable, and recoverable.
+
+```python
+from typing import TypedDict, Optional, List
+from dataclasses import dataclass, field
+
+
+@dataclass
+class PromotionalEvent:
+    deal_id: int
+    deal_name: str
+    sku_id: str
+    customer_id: str          # anonymized — never the customer name
+    location_id: str
+    start_date: str           # ISO 8601
+    end_date: str
+    discount_pct: float       # e.g., 0.30 for 30%
+    uplift_value: float       # from event_prod_loc_cust_uplift
+
+
+@dataclass
+class DemandDecomposition:
+    baseline_weekly_demand: float
+    historical_similar_events: List[dict]   # [{deal_id, lift_actual, discount_pct, ...}]
+    lift_scenarios: dict                    # {"conservative": 2.0, "moderate": 2.5, "aggressive": 3.0}
+    post_promo_dip_factor: float            # e.g., 0.6 = 60% of baseline for 6 weeks post-event
+    cannibalization_impact: dict            # {sku_id: pct_demand_reduction}
+    confidence: float                       # 0.0–1.0
+
+
+@dataclass
+class SupplyConstraints:
+    current_on_hand: float
+    on_order: float
+    committed: float
+    available_to_promise: float             # on_hand - committed + on_order
+    supplier_lead_time_weeks: float
+    max_order_quantity: float
+    dc_storage_capacity: float
+    is_fulfillable: bool
+    constraint_notes: List[str]             # plain-language for planner display
+
+
+@dataclass
+class Scenario:
+    name: str                               # "Conservative" | "Moderate" | "Aggressive"
+    lift_assumption: float
+    pre_stage_quantity: float
+    order_timing_weeks_before: int
+    service_level_target: float
+    post_event_rundown_weeks: int
+    week_by_week_demand: List[float]
+    narrative: str                          # LLM-generated rationale
+    is_feasible: bool
+
+
+@dataclass
+class FinancialImpact:
+    scenario_name: str
+    projected_revenue: float
+    carrying_cost: float
+    expected_stockout_cost: float
+    net_financial_impact: float
+    confidence_interval_pct: float          # e.g., 15.0 means ±15%
+
+
+class ScenarioPlanningState(TypedDict):
+    # Input
+    event: Optional[PromotionalEvent]
+
+    # Agent outputs (None until written)
+    demand_decomposition: Optional[DemandDecomposition]
+    supply_constraints: Optional[SupplyConstraints]
+    scenarios: Optional[List[Scenario]]
+    financial_impacts: Optional[List[FinancialImpact]]
+
+    # Control
+    current_step: str
+    errors: List[str]
+    planner_selection: Optional[str]
+    messages: List[dict]                    # full agent reasoning trace
+```
+
+**State design principles:**
+- All fields optional at initialization except `event`
+- Agents must handle `None` upstream fields gracefully — write to `errors`, don't raise unhandled exceptions
+- `messages` is the observability log: every agent appends reasoning steps with timestamp and agent name
+- No agent may modify another agent's output fields — Orchestrator reads all but only writes to `current_step`, `errors`, `messages`
+
+---
+
+### 6.2 Agent Definitions
+
+#### Agent 1: Orchestrator
+
+| Property | Value |
+|----------|-------|
+| Type | Router / Coordinator |
+| Runs LLM? | No |
+| Tools | None |
+
+Validates event at pipeline entry, routes state to correct downstream agents, aggregates outputs into final presentation package, handles error conditions with graceful degradation decisions.
+
+```python
+def route_after_orchestrator(state: ScenarioPlanningState) -> str:
+    if state["errors"] or state["event"] is None:
+        return "error"
+    return "run_analysis"
+```
+
+---
+
+#### Agent 2: Demand Decomposition
+
+| Property | Value |
+|----------|-------|
+| Type | LLM + Tool-use |
+| Runs LLM? | Yes — for pattern reasoning and confidence assessment |
+| Tools | `get_baseline_demand`, `find_similar_events`, `get_product_substitutes` |
+| Output | `demand_decomposition` |
+
+**Responsibilities:** Query 52-week baseline demand. Find historical similar promotions. Reason about Conservative/Moderate/Aggressive lift multipliers based on historical evidence. Estimate post-promo dip. Identify cannibalization candidates.
+
+**Tool Specifications:**
+
+```python
+def get_baseline_demand(sku_id: str, weeks: int = 52) -> dict:
+    """
+    Queries demand_history for trailing N weeks, excluding promotional periods.
+    Returns: {weekly_demand: List[float], average: float, stddev: float, seasonality_index: float}
+    """
+
+def find_similar_events(
+    product_group: str,
+    discount_pct_range: tuple[float, float],
+    date_range: tuple[str, str]
+) -> List[dict]:
+    """
+    Queries deal JOIN event_prod_loc_cust_uplift for completed promotions matching criteria.
+    Returns: [{deal_id, discount_pct, uplift_actual, duration_weeks, post_promo_dip_factor, ...}]
+    """
+
+def get_product_substitutes(sku_id: str) -> List[dict]:
+    """
+    POC #1 (SQL): Queries product hierarchy for same-product_class SKUs.
+    Returns: [{sku_id, relationship_type}]
+    Phase 3 upgrade: replaced by KG traversal with weighted edges.
+    """
+```
+
+**Confidence Scoring:**
+
+| Historical Events Found | Confidence |
+|------------------------|------------|
+| ≥ 3 similar events | 0.8–1.0 (High) |
+| 1–2 similar events | 0.4–0.7 (Medium) |
+| 0 similar events | 0.0–0.3 (Low) |
+
+---
+
+#### Agent 3: Supply Constraint
+
+| Property | Value |
+|----------|-------|
+| Type | Deterministic calculation + LLM narration |
+| Runs LLM? | Yes — only for plain-language constraint summary |
+| Tools | `get_inventory_position`, `get_sourcing_constraints`, `get_storage_capacity` |
+| Output | `supply_constraints` |
+
+**All numerical calculations are deterministic.** LLM is called exactly once at the end to convert structured constraint data into a plain-language summary for the planner display.
+
+```python
+def get_inventory_position(sku_id: str, location_id: str) -> dict:
+    """
+    Returns: {on_hand, on_order, committed, available_to_promise}
+    """
+
+def get_sourcing_constraints(sku_id: str, location_id: str) -> dict:
+    """
+    Queries product_sourcing_network.
+    Returns: {lead_time_weeks, min_order_qty, max_order_qty, supplier_id}
+    Note: supplier_name NOT included in LLM prompts (PII/anonymization).
+    """
+
+def get_storage_capacity(location_id: str) -> dict:
+    """
+    Returns: {total_capacity_units, current_utilization_units, available_capacity_units}
+    """
+```
+
+---
+
+#### Agent 4: Scenario Generator
+
+| Property | Value |
+|----------|-------|
+| Type | LLM reasoning agent |
+| Runs LLM? | Yes — primary reasoning agent |
+| Tools | None (pure reasoning over structured context) |
+| Output | `scenarios` |
+
+**Core principle:** Scenarios must differ in their **underlying demand assumption** — what the agent believes will happen in the market — not merely in ±10% variations on a single parameter.
+
+**Post-generation validation:**
+- Exactly 3 scenarios present
+- Names are "Conservative", "Moderate", "Aggressive"
+- `lift_assumption` values span at least 0.5x range
+- `is_feasible` correctly reflects supply constraint data
+- If any check fails: append to `errors`, re-invoke with corrective instruction (max 1 retry)
+
+---
+
+#### Agent 5: Financial Impact
+
+| Property | Value |
+|----------|-------|
+| Type | Deterministic calculation + LLM formatting |
+| Runs LLM? | Yes — for recommendation narrative only |
+| Tools | `get_unit_cost`, `get_carrying_cost_rate`, `get_customer_margin`, `calculate_cosa` |
+| Output | `financial_impacts` |
+
+**All financial calculations are deterministic.** LLM never generates numbers — only formats the recommendation narrative around pre-computed figures. This is required for SOX traceability.
+
+```python
+# Financial calculation logic
+projected_revenue = sum(week_by_week_demand) * unit_selling_price * customer_margin
+
+holding_weeks = pre_stage_quantity / average_weekly_demand_during_event
+carrying_cost = pre_stage_quantity * unit_cost * (annual_carrying_cost_rate / 52) * holding_weeks
+
+cosa_result = calculate_cosa(scenario, event, unit_cost)
+expected_stockout_cost = cosa_result["shortage_units"] * unit_selling_price * customer_margin
+
+net_financial_impact = projected_revenue - carrying_cost - expected_stockout_cost
+
+# Confidence interval: wider when demand confidence is lower
+confidence_interval_pct = (1 - demand_decomposition.confidence) * 30  # max ±30% at zero confidence
+```
+
+```python
+def calculate_cosa(scenario: Scenario, event: PromotionalEvent, unit_cost: float) -> dict:
+    """
+    Reimplements COSA logic for a projected scenario.
+    Returns: {shortage_units, excess_units, cosa_cost}
+    Uses scenario.week_by_week_demand and scenario.pre_stage_quantity.
+    """
+```
+
+---
+
+### 6.3 LangGraph Graph Definition
+
+```python
+from langgraph.graph import StateGraph, END
+from scenario_planning.state import ScenarioPlanningState
+from scenario_planning.agents import (
+    orchestrator_agent, route_after_orchestrator,
+    demand_decomposition_agent, supply_constraint_agent,
+    scenario_generator_agent, financial_impact_agent,
+    present_scenarios
+)
+
+
+def build_scenario_planning_graph():
+    graph = StateGraph(ScenarioPlanningState)
+
+    # Register nodes
+    graph.add_node("orchestrator",          orchestrator_agent)
+    graph.add_node("demand_decomposition",  demand_decomposition_agent)
+    graph.add_node("supply_constraint",     supply_constraint_agent)
+    graph.add_node("scenario_generator",    scenario_generator_agent)
+    graph.add_node("financial_impact",      financial_impact_agent)
+    graph.add_node("present_to_planner",    present_scenarios)
+
+    # Entry point
+    graph.set_entry_point("orchestrator")
+
+    # Orchestrator routes to parallel analysis or error
+    graph.add_conditional_edges(
+        "orchestrator",
+        route_after_orchestrator,
+        {
+            "run_analysis": ["demand_decomposition", "supply_constraint"],  # parallel
+            "error": END
+        }
+    )
+
+    # Both analysis agents must complete before scenario generator runs
+    graph.add_edge("demand_decomposition", "scenario_generator")
+    graph.add_edge("supply_constraint",    "scenario_generator")
+
+    # Sequential from scenario generation onward
+    graph.add_edge("scenario_generator",   "financial_impact")
+    graph.add_edge("financial_impact",     "present_to_planner")
+    graph.add_edge("present_to_planner",   END)
+
+    return graph.compile()
+
+
+def run_scenario_planning(event: PromotionalEvent) -> ScenarioPlanningState:
+    graph = build_scenario_planning_graph()
+    initial_state: ScenarioPlanningState = {
+        "event": event,
+        "demand_decomposition": None,
+        "supply_constraints": None,
+        "scenarios": None,
+        "financial_impacts": None,
+        "current_step": "orchestrator",
+        "errors": [],
+        "planner_selection": None,
+        "messages": []
+    }
+    return graph.invoke(initial_state)
+```
+
+---
+
+### 6.4 Data Flow Diagram
+
+| Agent | Reads from State | DB Tables Queried | Writes to State |
+|-------|-----------------|------------------|----------------|
+| Orchestrator | `event` (all fields) | None | `current_step`, `messages` |
+| Demand Decomposition | `event.sku_id`, `event.discount_pct`, `event.customer_id`, `event.start_date` | `demand_history`, `deal`, `event_prod_loc_cust_uplift`, `product` | `demand_decomposition` |
+| Supply Constraint | `event.sku_id`, `event.location_id`, `event.start_date` | `product_sourcing_network`, `approved_order`, `enterprise_settings`, location capacity tables | `supply_constraints` |
+| Scenario Generator | `demand_decomposition` (full), `supply_constraints` (full) | None — LLM reasoning only | `scenarios` |
+| Financial Impact | `scenarios`, `event.sku_id`, `event.customer_id` | `product` (unit_cost), customer + pricing tables (margin), `enterprise_settings` (carrying_cost_rate) | `financial_impacts` |
+| Present to Planner | `scenarios`, `financial_impacts`, `demand_decomposition.confidence`, `errors` | None | `messages` (final trace) |
+
+**All database access is read-only against TenantDB.** No agent writes directly to any table.
+
+---
+
+### 6.5 Tool Registry (POC #1)
+
+```python
+# Cost-optimized model routing — Haiku for simple steps, Sonnet for complex reasoning
+AGENTS_LLM_MAP = {
+    "orchestrator":         "claude-haiku-4-5-20251001",   # routing only
+    "demand_decomposition": "claude-sonnet-4-6",            # complex pattern reasoning
+    "supply_constraint":    "claude-haiku-4-5-20251001",   # deterministic + narration
+    "scenario_generator":   "claude-sonnet-4-6",            # primary reasoning agent
+    "financial_impact":     "claude-haiku-4-5-20251001",   # math + formatting
+}
+```
+
+---
+
+### 6.6 Prompt Engineering Strategy
+
+#### Scenario Generator Prompt (Critical Agent)
+
+**Principle 1: Provide structured narrative context, not raw data.**
+
+```
+# WRONG (raw data — avoid)
+demand_history: [120, 118, 125, 122, 119, ...]
+similar_events: [{deal_id: 4821, uplift: 2.3, discount: 0.28}, ...]
+
+# CORRECT (structured narrative — preferred)
+Baseline demand for SKU PROT-500-CHO averages 121 units/week over the trailing 52 weeks
+(excluding promotional periods). Two historical events match this promotion's profile:
+
+Event 4821 (Q3 2024): 28% discount, same product class, comparable customer segment.
+Actual lift: 2.3x baseline. Post-promo dip lasted 5 weeks at ~65% of baseline.
+
+Event 5103 (Q1 2025): 32% discount, same product class. Actual lift: 2.9x baseline.
+Post-promo dip lasted 7 weeks at ~58% of baseline.
+```
+
+**Principle 2: Require explicit reasoning before JSON output.**
+
+```
+Before generating JSON, reason through the following in a <thinking> block:
+1. Which historical event is most analogous to the current promotion, and why?
+2. What assumption separates Conservative from Moderate?
+3. What assumption separates Moderate from Aggressive?
+4. Are all three scenarios feasible given supply constraints? If not, which is infeasible?
+```
+
+**Principle 3: Enforce structured output via Claude tool_use.**
+Define `Scenario` objects as tool parameters with strict schemas. Instruct the LLM to "call the tool" with three scenarios as arguments. This eliminates JSON parsing failures.
+
+**Principle 4: Enforce meaningful differentiation explicitly.**
+
+Include verbatim in system prompt:
+> "The three scenarios MUST differ in their underlying demand assumption — what you believe customers will do — not merely in how much inventory is ordered. If the lift assumptions for Conservative, Moderate, and Aggressive are within 0.3x of each other, your scenarios are not meaningfully differentiated. Revise them."
+
+**Principle 5: Ground narratives to historical evidence.**
+
+> "For each lift scenario, cite the specific historical event(s) that support that assumption. Do not generate a scenario that is not supported by at least one historical data point or by a specific, stated business reason."
+
+---
+
+## 7. KG Integration: Phase 3 Upgrades
+
+When the Knowledge Graph is deployed in Phase 3, three specific changes are made to the Scenario Planning agent toolkit. The LangGraph graph definition **does not change** — only the tool implementations change. This is the payoff of the layered architecture.
+
+### Upgrade 1: `get_product_substitutes()` — SQL → KG
+
+```python
+# POC #1 (SQL) — flat join, no weights
+def get_product_substitutes(sku_id: str) -> List[dict]:
+    return sql_conn.execute("""
+        SELECT sku_id FROM product
+        WHERE product_class = (SELECT product_class FROM product WHERE sku_id = :sku)
+        AND sku_id <> :sku
+    """, sku=sku_id).scalars()
+
+# Phase 3 (KG) — weighted traversal, multi-hop
+def get_product_substitutes(sku_id: str, max_hops: int = 2) -> List[dict]:
+    """
+    Returns substitutes with weighted cannibalization at each traversal depth.
+    Direct substitutes (1 hop) at 30% weight; indirect (2 hops) at 10% weight.
+    """
+    with neo4j_driver.session() as session:
+        result = session.run("""
+            MATCH (source:Product {sku_id: $sku_id})
+                  -[r:SUBSTITUTES_FOR*1..2]->(sub:Product)
+            RETURN sub.sku_id AS sku_id,
+                   reduce(w=1.0, rel IN r | w * rel.cannibalization_weight) AS total_weight,
+                   length(r) AS hops
+            ORDER BY total_weight DESC
+        """, sku_id=sku_id)
+        return [{"sku_id": r["sku_id"], "weight": r["total_weight"], "hops": r["hops"]} for r in result]
+```
+
+**What this unlocks:** Demand Decomposition Agent can now report `"SKU PROT-500-VAN: 30% demand reduction expected (direct substitute)"` and `"SKU PROT-250-CHO: 10% demand reduction expected (indirect substitute)"` — directly improving the `cannibalization_impact` field quality.
+
+### Upgrade 2: New tool — `find_alternate_suppliers()`
+
+```python
+# Phase 3 — new tool for Supply Constraint Agent
+def find_alternate_suppliers(sku_id: str, excluded_supplier_id: str = None) -> List[dict]:
+    """
+    Finds alternate active suppliers for a SKU, ranked by lead time.
+    Used when primary supplier can't fulfill the Aggressive scenario on time.
+    """
+    with neo4j_driver.session() as session:
+        result = session.run("""
+            MATCH (s:Supplier)-[r:SUPPLIES]->(p:Product {sku_id: $sku_id})
+            WHERE s.supplier_id <> $excluded
+              AND s.status = 'active'
+            RETURN s.supplier_id, r.lead_time_weeks, s.country, r.fill_rate
+            ORDER BY r.lead_time_weeks ASC
+        """, sku_id=sku_id, excluded=excluded_supplier_id or "")
+        return [dict(r) for r in result]
+```
+
+**What this unlocks:** When the Aggressive scenario is marked infeasible (primary supplier lead time too long), the Supply Constraint Agent can now report: *"Aggressive scenario requires alternate supplier. NovaTech (lead time: 5 days, fill rate: 94%) can fulfill. Order must be placed by tomorrow."*
+
+### Upgrade 3: New tool — `find_customers_affected_by_promo()`
+
+```python
+# Phase 3 — new tool for Supply Constraint Agent
+def find_customers_affected_by_promo(sku_id: str, location_id: str) -> List[dict]:
+    """
+    Returns all customers served by this location for this product, ranked by priority.
+    Used to determine which customers to protect first if demand exceeds supply.
+    """
+    with neo4j_driver.session() as session:
+        result = session.run("""
+            MATCH (p:Product {sku_id: $sku_id})
+                  -[:STORED_AT]->(l:Location {location_id: $location_id})
+                  -[:SERVES]->(c:Customer)
+            RETURN c.customer_id, c.segment_tier, c.customer_group
+            ORDER BY c.segment_tier ASC
+        """, sku_id=sku_id, location_id=location_id)
+        return [dict(r) for r in result]
+```
+
+---
+
+## 8. Adding a New CASCI Use Case
+
+Building a new use case on the CASCI platform follows a five-step pattern. The platform handles the cross-cutting concerns (memory, MCP, observability, evaluation framework); the use case author only writes agent logic and tools.
+
+### Step 1: Define the State Schema
+
+```python
+# casci_platform/use_cases/supplier_risk/state.py
+
+class SupplierRiskState(TypedDict):
+    # Input
+    supplier_id: Optional[str]
+    alert_type: Optional[str]   # "quality_incident" | "capacity_constraint" | "geopolitical"
+
+    # Agent outputs
+    impact_analysis: Optional[SupplierImpactAnalysis]       # which products/locations/customers affected
+    risk_assessment: Optional[SupplierRiskAssessment]        # probability and severity
+    mitigation_options: Optional[List[MitigationOption]      # alternate suppliers, buffer stock, etc.
+
+    # Control (same pattern as all use cases)
+    current_step: str
+    errors: List[str]
+    messages: List[dict]
+```
+
+### Step 2: Register Required MCP Tools
+
+For Supplier Risk (UC-02), the new tools are KG-heavy:
+```python
+# New tools needed for UC-02 (all KG — require Phase 3 KG deployment)
+@mcp_tool
+def get_supplier_impact_chain(supplier_id: str) -> dict:
+    """KG traversal: Supplier → Products → Locations → Customers"""
+
+@mcp_tool
+def get_supplier_shared_materials(supplier_id: str) -> List[dict]:
+    """KG traversal: which other suppliers share this supplier's raw materials?"""
+
+@mcp_tool
+def get_historical_supplier_incidents(supplier_id: str) -> List[dict]:
+    """SQL: historical supplier performance from supplier_scorecard table"""
+```
+
+### Step 3: Define LangGraph Agents
+
+```python
+# Pattern: same as Scenario Planning — agents read/write shared state
+def impact_analysis_agent(state: SupplierRiskState) -> SupplierRiskState: ...
+def risk_assessment_agent(state: SupplierRiskState) -> SupplierRiskState: ...
+def mitigation_agent(state: SupplierRiskState) -> SupplierRiskState: ...
+```
+
+### Step 4: Build the Graph
+
+```python
+# Same pattern as Scenario Planning — only the nodes and edges change
+def build_supplier_risk_graph():
+    graph = StateGraph(SupplierRiskState)
+    graph.add_node("orchestrator",      orchestrator_agent)
+    graph.add_node("impact_analysis",   impact_analysis_agent)
+    graph.add_node("risk_assessment",   risk_assessment_agent)
+    graph.add_node("mitigation",        mitigation_agent)
+    # ... add edges ...
+    return graph.compile()
+```
+
+### Step 5: Build the Eval Suite
+
+Every CASCI use case must have its own eval suite following the same three-layer pattern (deterministic, structured accuracy, LLM-as-judge). Eval cases are historical incidents with known outcomes.
+
+```
+tests/eval/supplier_risk/
+├── incident_001.json     # real supplier incident with known impact and outcome
+├── incident_002.json
+└── run_evals.py          # same pattern as scenario_planning eval suite
+```
+
+### Platform Components Reused (No Rebuild Required)
+
+- MCP tool registry and registration pattern
+- LangSmith tracing setup
+- Pydantic output validation pattern
+- Confidence-based escalation logic
+- Human-in-the-loop enforcement pattern
+- Eval framework structure (three-layer, CI/CD gate pattern)
+- Model version pinning and governance
+- Cost tracking and anomaly alerting
+
+---
+
+## 9. Technology Stack
+
+| Layer | Technology | Rationale |
+|-------|-----------|-----------|
+| Agent orchestration | LangGraph (Python) | Native state management, parallel execution, human checkpoints, LangSmith integration |
+| LLM | Claude claude-sonnet-4-6 (Anthropic) | Strong structured output via tool_use; large context window; reliable JSON |
+| Low-reasoning LLM | Claude Haiku 4.5 | ~10x cheaper for formatting and routing steps |
+| Structured output | Claude tool_use | Enforces JSON schemas without post-hoc parsing |
+| DB access | SQLAlchemy + pyodbc | SQL Server (TenantDB) read-only; consistent with existing stack |
+| Graph DB | Neo4j (Phase 3) | Industry standard for supply chain entity graphs; Cypher query language |
+| Data processing | Polars | Consistent with demand planning codebase; performant for time-series |
+| API layer | FastAPI | Planner interface backend; consistent with existing microservice patterns |
+| Observability | LangSmith | Agent trace monitoring; per-run inspection with LangGraph native integration |
+| Deployment | AWS Lambda / ECR | Consistent with existing Blue Ridge deployment infrastructure |
+| Config management | Pydantic models | Consistent with existing codebase pattern |
+| Secrets management | AWS Secrets Manager | LLM API keys, DB credentials — never in code |
+| Feature flags | AWS AppConfig | Instant rollback without redeploy |
+
+---
+
+## 10. File Structure
+
+```
+casci/
+├── pyproject.toml
+├── src/
+│   ├── casci_platform/                    # Shared platform (extracted in Phase 2)
+│   │   ├── mcp_tools/
+│   │   │   ├── sql_tools/
+│   │   │   │   ├── demand_tools.py        # get_baseline_demand, find_similar_events
+│   │   │   │   ├── supply_tools.py        # get_inventory_position, get_sourcing_constraints
+│   │   │   │   └── financial_tools.py     # get_unit_cost, get_carrying_cost_rate, calculate_cosa
+│   │   │   ├── graph_tools/               # Phase 3 — KG tools
+│   │   │   │   ├── product_tools.py       # get_product_substitutes (KG version)
+│   │   │   │   ├── supplier_tools.py      # find_alternate_suppliers, get_supplier_network
+│   │   │   │   └── impact_tools.py        # find_customers_affected_by_promo
+│   │   │   └── algorithm_tools/
+│   │   │       └── cosa_tool.py           # calculate_cosa wrapper
+│   │   ├── memory/
+│   │   │   ├── instruction_memory.py      # L1: load tenant rules from enterprise_settings
+│   │   │   ├── episodic_memory.py         # L3: Phase 2 — agent decision log
+│   │   │   ├── profile_memory.py          # L4: Phase 2 — user/tenant preferences
+│   │   │   └── rag_memory.py              # L6: existing RAG pipeline connector
+│   │   ├── etl/                           # Phase 3 — KG ETL
+│   │   │   └── kg_etl.py                  # TenantDB → Neo4j sync
+│   │   └── eval/
+│   │       ├── eval_runner.py             # Platform-level eval orchestration
+│   │       └── judge.py                   # LLM-as-judge shared implementation
+│   │
+│   └── use_cases/
+│       └── scenario_planning/             # POC #1
+│           ├── __init__.py
+│           ├── main.py
+│           ├── state.py                   # ScenarioPlanningState + all dataclasses
+│           ├── graph.py                   # build_scenario_planning_graph()
+│           ├── agents/
+│           │   ├── orchestrator.py
+│           │   ├── demand_decomposition.py
+│           │   ├── supply_constraint.py
+│           │   ├── scenario_generator.py
+│           │   └── financial_impact.py
+│           ├── prompts/
+│           │   ├── demand_decomposition_v1.0.md
+│           │   ├── scenario_generator_v1.0.md
+│           │   └── financial_impact_v1.0.md
+│           └── configs/
+│               └── settings.py
+│
+└── tests/
+    ├── unit/
+    │   ├── test_demand_tools.py
+    │   ├── test_supply_tools.py
+    │   ├── test_financial_tools.py
+    │   └── test_scenario_validation.py
+    ├── integration/
+    │   └── test_historical_promo/
+    │       ├── event_fixture.json
+    │       ├── expected_demand_range.json
+    │       ├── expected_financial_range.json
+    │       └── test_full_pipeline.py
+    └── eval/
+        ├── scenario_planning/
+        │   ├── eval_dataset/              # historical promo eval cases (JSON)
+        │   ├── eval_demand.py
+        │   ├── eval_supply.py
+        │   ├── eval_scenarios.py          # LLM-as-judge
+        │   ├── eval_financial.py
+        │   └── eval_e2e.py
+        └── run_all_evals.py               # CI/CD eval gate entry point
+```
+
+---
+
+## 11. Key Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Orchestration framework | LangGraph | Deterministic control flow; native state management; parallel execution; human checkpoints; LangSmith integration. Avoids custom boilerplate. |
+| LLM | Claude Sonnet 4.6 | Strong tool_use for structured output; large context window for demand history; reliable JSON generation |
+| Number of scenarios | 3 (Conservative / Moderate / Aggressive) | Cognitive load research: 3 options is the maximum a planner can meaningfully evaluate. More forces artificial differentiation or decision paralysis. |
+| Parallel agent execution | Demand Decomposition + Supply Constraint in parallel | Fully independent. Reduces end-to-end latency ~40% vs. sequential. |
+| Financial calculation | Deterministic math + LLM narration only | Financial projections must be fully traceable (SOX compliance). LLM never generates numbers — only formats narrative around pre-computed figures. |
+| DB access mode | Read-only to TenantDB | Eliminates risk of agent errors corrupting production data. Write-back uses approved Blue Ridge APIs only. |
+| Human-in-the-loop | Mandatory for all policy changes (POC #1 = Autonomy Level 2) | Trust must be earned over multiple production cycles before any automation is considered. |
+| SQL vs. KG | SQL for POC #1; KG introduced in Phase 3 | KG adds power but adds infrastructure complexity. POC validates core agent logic first with SQL. KG is additive — no agent rewrites required when it's added. |
+| "Everything is an MCP tool" | All data sources wrapped as MCP tools | Adding a new data source means adding one tool registration, not modifying agent logic. This is the composability principle. |
+
+---
+
+## 12. Evaluation Strategy
+
+Full eval strategy per agent (evaluators, CI/CD gate thresholds, LangSmith integration, online eval pipeline) is documented in [PRD Section 7.6](PRD.md#76-ai-evaluation-criteria).
+
+**Quick reference — CI gate thresholds:**
+
+| Eval | Gate Threshold |
+|------|---------------|
+| Demand decomposition MAPE | < 20% on all eval cases |
+| Supply constraint ATP accuracy | Exact match on all eval cases |
+| Scenario judge score | ≥ 4.0 overall on all eval cases |
+| Financial accuracy | ≤ 15% error on all eval cases |
+| Recommendation correctness | Correct or regret < $5,000 on ≥ 80% of eval cases |
+| End-to-end generation time (p95) | < 5 minutes |
+
+Any regression on a previously passing eval case blocks the PR merge.
+
+---
+
+*Document Status: v1.0 — CASCI Platform Architecture. Covers POC #1 (Scenario Planning) as reference implementation, plus Knowledge Graph design for Phase 3, and the agent template pattern for adding new CASCI use cases.*
 
