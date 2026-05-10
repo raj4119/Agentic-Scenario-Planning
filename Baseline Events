@@ -462,3 +462,57 @@ LEFT JOIN dbo.sourcing_network_History sn_h
                                  FROM   event WHERE id = 41)
 
 WHERE e.id = 41
+
+--  Financial Inputs — AS OF T-14
+-- All values needed for the Financial Impact Agent:
+--   revenue = demand × current_price
+--   carrying_cost = pre_stage_qty × unit_cost × carrying_cost_rate × weeks
+--   stockout_cost = lost_sales × current_price
+--   net = revenue - carrying_cost - stockout_cost
+
+
+
+SELECT
+    p.id   AS product_id,
+    p.code AS product_code,
+    l.id   AS location_id,
+    l.code AS location_code,
+    c.id   AS customer_id,
+    c.code AS customer_code,
+
+    -- Cost & price at T-14 snapshot
+    pl_h.current_cost       AS unit_cost,
+    pl_h.current_price      AS unit_price,
+    pl_h.line_cost,
+    pl_h.carrying_cost      AS carrying_cost_rate,
+
+    -- Service level targets
+    pl_h.fill_rate_goal,
+    pl_h.service_level_objective,
+
+    -- Event duration
+    DATEDIFF(week, e.start_date, e.end_date) + 1 AS event_weeks,
+
+    -- Segment margin guardrails
+    cs.min_margin,
+    cs.max_margin
+
+FROM event e
+JOIN event_prod_loc_cust_xref eplcx
+    ON eplcx.event_id = e.id AND eplcx.is_deleted = 0
+JOIN product_location_customer_xref plc
+    ON plc.id = eplcx.prod_loc_cust_id
+JOIN product p   ON p.id  = plc.product_id
+JOIN location l  ON l.id  = plc.location_id
+JOIN customer c  ON c.id  = plc.customer_id
+JOIN customer_segment cs ON cs.id = c.segment_id
+
+JOIN dbo.product_location_xref_history pl_h
+    ON  pl_h.product_id  = plc.product_id
+    AND pl_h.location_id = plc.location_id
+    AND pl_h.StartTime  <= (SELECT CAST(DATEADD(day, -14, start_date) AS DATE)
+                                 FROM   event WHERE id = 41)
+    AND pl_h.EndTime     > (SELECT CAST(DATEADD(day, -14, start_date) AS DATE)
+                                 FROM   event WHERE id = 41)
+
+WHERE e.id = 41 AND e.is_deleted = 0
