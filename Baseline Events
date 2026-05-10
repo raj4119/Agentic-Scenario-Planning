@@ -229,3 +229,141 @@ JOIN event e ON e.id                                  = 41
   AND h.EndTime     >= DATEADD(week, -8, e.start_date)
   AND h.StartTime   <= DATEADD(week,  6, e.end_date)
 ORDER BY h.StartTime
+
+
+-- Comparable Event Matching + Actual Lift Ratios
+-- Finds past completed events matching:
+--   same product_group + same customer segment
+-- Computes Conservative (p25) / Moderate (p50) / Aggressive (p75)
+-- ============================================================
+
+-- Step A: anchor event parameters
+WITH anchor AS (
+    SELECT DISTINCT
+        pg.id   AS product_group_id,
+        pg.code AS product_group_code,
+        seg.id  AS customer_segment_id,
+        seg.name AS customer_segment_name
+    FROM event e
+    JOIN event_prod_loc_cust_xref eplcx ON eplcx.event_id = e.id AND eplcx.is_deleted = 0
+    JOIN product_location_customer_xref plc ON plc.id = eplcx.prod_loc_cust_id
+    JOIN product p ON p.id = plc.product_id
+    JOIN product_group pg ON pg.id = p.product_primary_group_id
+    JOIN customer c ON c.id = plc.customer_id
+    JOIN segment seg ON seg.id = c.segment_id
+    WHERE e.id = 41 AND e.is_deleted = 0
+),
+comparable_events AS (
+    SELECT DISTINCT
+        e_comp.id          AS comp_event_id,
+        e_comp.code        AS comp_event_code,
+        e_comp.name        AS comp_event_name,
+        e_comp.start_date  AS comp_start,
+        e_comp.end_date    AS comp_end,
+        eplcx_comp.prod_loc_cust_id AS comp_plc_id,
+        a.product_group_code,
+        a.customer_segment_name
+    FROM anchor a
+    JOIN product p_comp ON p_comp.product_primary_group_id = a.product_group_id
+    JOIN product_location_customer_xref plc_comp ON plc_comp.product_id = p_comp.id
+    JOIN customer c_comp ON c_comp.id = plc_comp.customer_id
+    JOIN segment seg_comp ON seg_comp.id = c_comp.segment_id
+        AND seg_comp.name = a.customer_segment_name
+    JOIN event_prod_loc_cust_xref eplcx_comp ON eplcx_comp.prod_loc_cust_id = plc_comp.id
+        AND eplcx_comp.is_deleted = 0
+    JOIN event e_comp ON e_comp.id = eplcx_comp.event_id
+        AND e_comp.is_deleted = 0
+        AND e_comp.id <> 41
+        AND e_comp.end_date < GETDATE()   -- completed events only
+),
+comp_lift AS (
+    SELECT
+        ce.comp_event_id,
+        ce.comp_event_code,
+        ce.comp_event_name,
+        ce.comp_start,
+        ce.comp_end,
+        ce.product_group_code,
+        ce.customer_segment_name,
+        AVG(CASE
+            WHEN ds.name = 'sales'
+             AND dp.period_end <  ce.comp_start
+             AND dp.period_end >= DATEADD(week, -8, ce.comp_start)
+            THEN unpvt.demand_value
+        END) AS pre_event_baseline,
+        SUM(CASE
+            WHEN ds.name = 'sales'
+             AND dp.period_start <= ce.comp_end
+             AND dp.period_end   >= ce.comp_start
+            THEN unpvt.demand_value
+        END) AS actual_sales_during,
+        SUM(CASE
+            WHEN ds.name = 'event'
+             AND dp.period_start <= ce.comp_end
+             AND dp.period_end   >= ce.comp_start
+            THEN unpvt.demand_value
+        END) AS actual_event_uplift,
+        SUM(CASE
+            WHEN ds.name = 'lostsales'
+             AND dp.period_start <= ce.comp_end
+             AND dp.period_end   >= ce.comp_start
+            THEN unpvt.demand_value
+        END) AS lost_sales_during
+    FROM comparable_events ce
+    JOIN demand_history dh ON dh.prod_loc_cust_id = ce.comp_plc_id
+    JOIN demand_signal ds ON ds.id = dh.demand_signal_id
+        AND ds.name IN ('sales', 'event', 'lostsales')
+    CROSS APPLY (VALUES
+        (1,P1),(2,P2),(3,P3),(4,P4),(5,P5),(6,P6),(7,P7),(8,P8),
+        (9,P9),(10,P10),(11,P11),(12,P12),(13,P13),(14,P14),(15,P15),(16,P16),
+        (17,P17),(18,P18),(19,P19),(20,P20),(21,P21),(22,P22),(23,P23),(24,P24),
+        (25,P25),(26,P26),(27,P27),(28,P28),(29,P29),(30,P30),(31,P31),(32,P32),
+        (33,P33),(34,P34),(35,P35),(36,P36),(37,P37),(38,P38),(39,P39),(40,P40),
+        (41,P41),(42,P42),(43,P43),(44,P44),(45,P45),(46,P46),(47,P47),(48,P48),
+        (49,P49),(50,P50),(51,P51),(52,P52),(53,P53),(54,P54),(55,P55),(56,P56),
+        (57,P57),(58,P58),(59,P59),(60,P60),(61,P61),(62,P62),(63,P63),(64,P64),
+        (65,P65),(66,P66),(67,P67),(68,P68),(69,P69),(70,P70),(71,P71),(72,P72),
+        (73,P73),(74,P74),(75,P75),(76,P76),(77,P77),(78,P78),(79,P79),(80,P80),
+        (81,P81),(82,P82),(83,P83),(84,P84),(85,P85),(86,P86),(87,P87),(88,P88),
+        (89,P89),(90,P90),(91,P91),(92,P92),(93,P93),(94,P94),(95,P95),(96,P96),
+        (97,P97),(98,P98),(99,P99),(100,P100),(101,P101),(102,P102),(103,P103),(104,P104),
+        (105,P105),(106,P106),(107,P107),(108,P108),(109,P109),(110,P110),(111,P111),(112,P112),
+        (113,P113),(114,P114),(115,P115),(116,P116),(117,P117),(118,P118),(119,P119),(120,P120),
+        (121,P121),(122,P122),(123,P123),(124,P124),(125,P125),(126,P126),(127,P127),(128,P128),
+        (129,P129),(130,P130),(131,P131),(132,P132),(133,P133),(134,P134),(135,P135),(136,P136),
+        (137,P137),(138,P138),(139,P139),(140,P140),(141,P141),(142,P142),(143,P143),(144,P144),
+        (145,P145),(146,P146),(147,P147),(148,P148),(149,P149),(150,P150),(151,P151),(152,P152),
+        (153,P153),(154,P154),(155,P155),(156,P156)
+    ) AS unpvt(period_number, demand_value)
+    JOIN period dp ON dp.period_number = unpvt.period_number
+    WHERE dp.period_end   >= DATEADD(week, -8, ce.comp_start)
+      AND dp.period_start <= ce.comp_end
+    GROUP BY
+        ce.comp_event_id, ce.comp_event_code, ce.comp_event_name,
+        ce.comp_start, ce.comp_end, ce.product_group_code, ce.customer_segment_name
+)
+SELECT
+    comp_event_id,
+    comp_event_code,
+    comp_event_name,
+    comp_start,
+    comp_end,
+    product_group_code,
+    customer_segment_name,
+    pre_event_baseline,
+    actual_sales_during,
+    actual_event_uplift,
+    lost_sales_during,
+    actual_sales_during / NULLIF(pre_event_baseline, 0)                               AS actual_lift_ratio,
+    PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY actual_sales_during / NULLIF(pre_event_baseline, 0)) OVER () AS conservative_lift_p25,
+    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY actual_sales_during / NULLIF(pre_event_baseline, 0)) OVER () AS moderate_lift_p50,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY actual_sales_during / NULLIF(pre_event_baseline, 0)) OVER () AS aggressive_lift_p75,
+    COUNT(*) OVER ()                                                                   AS comparable_count,
+    CASE
+        WHEN COUNT(*) OVER () >= 3 THEN 'HIGH'
+        WHEN COUNT(*) OVER () >= 1 THEN 'MEDIUM'
+        ELSE 'LOW'
+    END AS confidence_tier
+FROM comp_lift
+WHERE pre_event_baseline > 0
+ORDER BY actual_lift_ratio DESC;
