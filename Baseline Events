@@ -367,3 +367,98 @@ SELECT
 FROM comp_lift
 WHERE pre_event_baseline > 0
 ORDER BY actual_lift_ratio DESC;
+
+
+-- Supply Constraint Snapshot — ATP at T-14
+-- Uses history tables to reconstruct state as of T-14
+-- ============================================================
+
+SELECT
+    plc.product_id,
+    plc.location_id,
+
+    -- Inventory at T-14 (from history)
+    pl_h.inventory_BOH,
+    pl_h.inventory_onorder,
+    pl_h.inventory_reserved,
+    pl_h.inventory_backorder,
+    pl_h.total_on_hold_quantity,
+
+    -- Available-to-Promise = BOH - reserved + on_order
+    pl_h.inventory_BOH
+        - ISNULL(pl_h.inventory_reserved, 0)
+        + ISNULL(pl_h.inventory_onorder, 0)     AS atp_at_t14,
+
+    -- Lead time at T-14
+    pl_h.lead_time_days                         AS pl_lead_time_days,
+    sn_h.quoted_lead_time                       AS sn_quoted_lead_time,
+    sn_h.source_transit_time,
+    sn_h.total_lead_time,
+
+    -- Order constraints at T-14 (from PSN history)
+    psn_h.min_purchase_quantity                 AS moq,
+    psn_h.minimum_order_units,
+    psn_h.maximum_order_units,
+    psn_h.hard_maximum_units,
+    psn_h.buying_multiple_units,
+
+    -- Days until event from T-14
+    DATEDIFF(day,(SELECT CAST(DATEADD(day, -14, start_date) AS DATE)
+                                 FROM   event WHERE id = 41), e.start_date)      AS days_until_event,
+
+    -- Fulfillability flags
+    CASE
+        WHEN DATEDIFF(day, (SELECT CAST(DATEADD(day, -14, start_date) AS DATE)
+                                 FROM   event WHERE id = 41), e.start_date)
+             >= ISNULL(sn_h.quoted_lead_time, pl_h.lead_time_days)
+        THEN 1 ELSE 0
+    END                                         AS is_prestage_feasible,
+
+    CASE
+        WHEN DATEDIFF(day,(SELECT CAST(DATEADD(day, -14, start_date) AS DATE)
+                                 FROM   event WHERE id = 41), e.start_date)
+             < ISNULL(sn_h.quoted_lead_time, pl_h.lead_time_days)
+        THEN 'ATP only — lead time exceeds remaining window'
+        ELSE 'Pre-stage order feasible'
+    END                                         AS fulfillability_note,
+
+    -- Sourcing network details
+    sn.id                                       AS sourcing_network_id,
+    sn.order_policy
+
+FROM event e
+JOIN event_prod_loc_cust_xref eplcx ON eplcx.event_id  = e.id
+                                    AND eplcx.is_deleted = 0
+JOIN product_location_customer_xref plc ON plc.id      = eplcx.prod_loc_cust_id
+
+-- product_location_xref AS OF T-14
+JOIN dbo.product_location_xref_history pl_h
+    ON  pl_h.product_id  = plc.product_id
+    AND pl_h.location_id = plc.location_id
+    AND pl_h.StartTime  <= (SELECT CAST(DATEADD(day, -14, start_date) AS DATE)
+                                 FROM   event WHERE id = 41)
+    AND pl_h.EndTime     > (SELECT CAST(DATEADD(day, -14, start_date) AS DATE)
+                                 FROM   event WHERE id = 41)
+
+-- product_sourcing_network AS OF T-14
+LEFT JOIN product_sourcing_network_xref_History psn_h
+    ON  psn_h.product_id = plc.product_id
+    AND psn_h.StartTime <= (SELECT CAST(DATEADD(day, -14, start_date) AS DATE)
+                                 FROM   event WHERE id = 41)
+    AND psn_h.EndTime    > (SELECT CAST(DATEADD(day, -14, start_date) AS DATE)
+                                 FROM   event WHERE id = 41)
+
+-- sourcing_network (for lead time and order policy)
+LEFT JOIN sourcing_network sn
+    ON  sn.id = psn_h.sourcingnetwork_id
+    AND sn.to_location = plc.location_id
+
+-- sourcing_network AS OF T-14
+LEFT JOIN dbo.sourcing_network_History sn_h
+    ON  sn_h.id         = sn.id
+    AND sn_h.StartTime <= (SELECT CAST(DATEADD(day, -14, start_date) AS DATE)
+                                 FROM   event WHERE id = 41)
+    AND sn_h.EndTime    > (SELECT CAST(DATEADD(day, -14, start_date) AS DATE)
+                                 FROM   event WHERE id = 41)
+
+WHERE e.id = 41
