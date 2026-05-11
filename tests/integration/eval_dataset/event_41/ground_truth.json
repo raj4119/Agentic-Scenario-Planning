@@ -1,0 +1,12 @@
+{
+  "_comment": "Ground truth for event 41 — fill in actual values from demand_history post-event",
+  "event_id": 41,
+  "actual_lift_multiplier": null,
+  "baseline_weekly_avg": null,
+  "actual_weekly_demand_during": [],
+  "actual_post_promo_dip_factor": null,
+  "actual_net_financial_impact": null,
+  "stockout_occurred": null,
+  "excess_units_post_promo": null,
+  "planner_notes": ""
+}
