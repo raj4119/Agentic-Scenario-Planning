@@ -43,7 +43,7 @@ def pipeline_result():
         start_date=str(row["start_date"]),
         end_date=str(row["end_date"]),
         duration_weeks=int(row["event_duration_weeks"]),
-        discount_pct=float(row["discount_pct"]),
+        discount_pct=float(row.get("discount_pct") or 0.0),
         planned_uplift=float(row["planned_uplift"]),
     )
     return run_scenario_planning(event)

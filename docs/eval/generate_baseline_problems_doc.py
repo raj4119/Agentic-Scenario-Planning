@@ -20,44 +20,50 @@ PROBLEMS = [
             "event_prod_loc_cust_xref). Without this anchor, downstream queries have no join key and "
             "the agent cannot distinguish one event from another. This query also surfaces the planner's "
             "original intent — planned uplift, expected demand, and order quantity — which is the baseline "
-            "against which AI recommendations are compared."
+            "against which AI recommendations are compared. Column aliases are normalised for the Python "
+            "tool layer: event.name is returned as deal_name, start_date and end_date are explicit aliases, "
+            "and event_duration_weeks is derived alongside days. discount_pct is returned as NULL — it is "
+            "not stored on the event or eplcx record in the current schema."
         ),
         "tables": ["event", "event_prod_loc_cust_xref", "product_location_customer_xref",
                    "product", "location", "customer", "product_class", "product_group",
                    "product_family", "segment"],
         "key_outputs": [
-            "event_id, event_code, event_name, start_date, end_date, event_duration_days",
+            "event_id, event_code, deal_name, start_date, end_date",
+            "event_duration_days, event_duration_weeks",
             "product_id, product_class, product_group, product_family",
             "location_id, customer_id, customer_segment",
-            "planned_uplift_total, planned_demand_total, quantity_ordered",
+            "planned_uplift, planned_demand_total, quantity_ordered",
+            "discount_pct (NULL — source column not present in current schema)",
         ],
         "agent": "Orchestrator / Demand Decomposition Agent",
         "decision_enabled": "Establishes the event scope and the planner's baseline expectation. Every other agent's output is contextualized against this.",
     },
     {
         "number": 2,
-        "query": "Planned vs Actual Uplift",
-        "problem_statement": "What did the planner expect demand to look like at T-14 (14 days before the event), and what actually happened week-by-week during the event window?",
+        "query": "Pre-event Baseline Demand",
+        "problem_statement": "What was the average weekly sales demand in the 8 weeks before the event — the stable baseline that all three lift scenarios are multiplied against?",
         "why_it_matters": (
-            "Promotional planning suffers from a common failure mode: the plan is set weeks in advance, "
-            "but inventory decisions are made at T-14. By that point, the plan may already be stale. "
-            "This query captures two views simultaneously: (1) the planned uplift as it existed in the "
-            "system exactly 14 days before the event — using history tables to reconstruct the T-14 "
-            "snapshot — and (2) the actual demand that materialized period-by-period from demand_history "
-            "with signal='event'. The gap between these two views is where planning errors live. "
-            "The Demand Decomposition Agent uses the actual branch to compute the pre-event baseline "
-            "weekly average, which anchors all three lift scenarios."
+            "Redesigned 2026-05-15: the original planned-vs-actual UNION approach was replaced with a "
+            "focused 8-week trailing sales average. The change was driven by one insight: planned uplift "
+            "is a planner guess, not a data signal. Scenarios are anchored to comparable event actuals "
+            "from Query 4 (p25/p50/p75 lift ratios) — not to what the planner hoped would happen. "
+            "Adding the planned branch introduced noise and a structural mismatch (event-signal demand "
+            "vs sales-signal baseline). The new design is a three-CTE pipeline: event_plc narrows to "
+            "the relevant prod_loc_cust rows, baseline_periods identifies the 8 weekly periods before "
+            "event start, and weekly_totals sums across all PLCs per period. The final AVG gives one "
+            "authoritative number: baseline_weekly_avg. This is the denominator in every lift calculation "
+            "downstream. The query is already implemented directly in demand_tools.py."
         ),
-        "tables": ["event_prod_loc_cust_uplift_History", "event_prod_loc_cust_xref_history",
-                   "product_location_customer_xref", "demand_history", "demand_signal", "period"],
+        "tables": ["event", "event_prod_loc_cust_xref", "product_location_customer_xref",
+                   "demand_history", "demand_signal", "period"],
         "key_outputs": [
-            "planned_uplift_units per period (from history at T-14)",
-            "actual_event_demand per period (P1–P156 unpivoted)",
-            "baseline_weekly_avg derived from pre-event periods",
-            "planned vs actual gap visible for post-event retrospective",
+            "baseline_weekly_avg — single float, average weekly sales units across 8 pre-event weeks",
+            "Uses demand_signal = 'sales' only (not 'event' or 'lostsales')",
+            "Aggregates across all prod_loc_cust combinations for the event",
         ],
         "agent": "Demand Decomposition Agent",
-        "decision_enabled": "Provides the pre-event baseline weekly demand that all three scenario lift multipliers are applied to. Without this, the agent cannot compute Conservative / Moderate / Aggressive unit totals.",
+        "decision_enabled": "Provides the pre-event baseline weekly demand that all three scenario lift multipliers are applied against. Conservative = baseline × lift_p25 × weeks; Moderate = baseline × lift_p50 × weeks; Aggressive = baseline × lift_p75 × weeks.",
     },
     {
         "number": 3,
@@ -108,9 +114,9 @@ PROBLEMS = [
                    "demand_history", "demand_signal", "period"],
         "key_outputs": [
             "comparable_count and confidence_tier (HIGH / MEDIUM / LOW)",
-            "conservative_lift_p25 — anchor for Conservative scenario",
-            "moderate_lift_p50 — anchor for Moderate scenario (recommended default)",
-            "aggressive_lift_p75 — anchor for Aggressive scenario",
+            "lift_p25 — anchor for Conservative scenario",
+            "lift_p50 — anchor for Moderate scenario (recommended default)",
+            "lift_p75 — anchor for Aggressive scenario",
             "actual_lift_ratio per comparable event",
             "pre_event_baseline, actual_sales_during, actual_event_uplift, lost_sales_during",
         ],
@@ -136,12 +142,12 @@ PROBLEMS = [
                    "product_location_xref_history", "product_sourcing_network_xref_History",
                    "sourcing_network", "sourcing_network_History"],
         "key_outputs": [
-            "atp_at_t14 (BOH - reserved + on_order)",
-            "pl_lead_time_days, sn_quoted_lead_time, total_lead_time",
-            "moq (minimum order quantity), maximum_order_units",
+            "atp (BOH - reserved + on_order) at T-14",
+            "lead_time_days (SN quoted_lead_time, fallback to pl_lead_time_days)",
+            "moq (minimum order quantity), max_order_qty",
             "days_until_event from T-14",
-            "is_prestage_feasible (1 / 0)",
-            "fulfillability_note — plain language label",
+            "lead_time_feasible (1 / 0)",
+            "sourcing_notes — plain language label",
             "order_policy from sourcing network",
         ],
         "agent": "Supply Constraint Agent",
@@ -169,8 +175,9 @@ PROBLEMS = [
             "unit_cost, unit_price at T-14",
             "carrying_cost_rate (annual, e.g. 0.25 = 25%)",
             "fill_rate_goal, service_level_objective",
-            "event_weeks (duration)",
+            "event_duration_weeks (derived from event start/end dates)",
             "min_margin, max_margin (segment guardrails)",
+            "customer_margin — (min_margin + max_margin) / 2.0",
         ],
         "agent": "Financial Impact Agent",
         "decision_enabled": "Enables deterministic calculation of projected_revenue, carrying_cost, expected_stockout_cost, and net_financial_impact for each scenario. Margin guardrails let the agent flag a margin breach before the planner commits.",
@@ -188,15 +195,19 @@ PROBLEMS = [
             "8-week baseline and their actual sales during the event window. The cannibalization_factor "
             "is expressed as (actual_during / pre_baseline) - 1.0 — a negative number. "
             "If no historical data exists for a substitute, a conservative default of -20% is applied. "
+            "Implementation note (2026-05-15): the original query used T-SQL DECLARE blocks "
+            "(@event_id, @event_start, @event_end, @min_period, @max_period) which are incompatible "
+            "with SQLAlchemy bind parameters. The query was rewritten using an event_bounds CTE to "
+            "compute these values inline, preserving the same logic without DECLARE. "
             "The Demand Decomposition Agent surfaces these factors; the Scenario Generator incorporates "
             "them into the net incremental demand calculation and the final narrative."
         ),
         "tables": ["event", "event_prod_loc_cust_xref", "product_location_customer_xref",
                    "product", "product_class", "demand_history", "demand_signal", "period"],
         "key_outputs": [
-            "sub_product_id, sub_product_code, sub_product_name",
+            "sku_id (sub_product_id alias), sub_product_code, sub_product_name",
             "shared_product_class",
-            "sub_pre_event_baseline (8-week avg before event)",
+            "baseline_demand (sub_pre_event_baseline alias — 8-week avg before event)",
             "sub_actual_sales_during (sales during promotion window)",
             "cannibalization_factor: (actual/baseline) - 1.0, default -0.20",
         ],

@@ -1,19 +1,23 @@
-"""
-Demand-side tool functions for the Demand Decomposition Agent.
+-- ============================================================
+-- CASCI Scenario Planning — Parameterized SQL Queries
+-- All queries use :event_id as the SQLAlchemy bind parameter.
+-- Column aliases match the Python tool function return dicts.
+--
+-- Source: Baseline Events (originally hardcoded event 41)
+-- Changes from source:
+--   - All = 41 / <> 41 replaced with = :event_id / <> :event_id
+--   - Column aliases corrected to match Python tool return keys
+--   - Q2 redesigned 2026-05-15: planned uplift dropped, 8-week sales baseline used
+--   - Q7 DECLARE blocks removed; replaced with event_bounds CTE
+-- ============================================================
 
-Each function wraps one of the SQL queries from the Baseline Events workbook:
-  get_event_details()       → Query 1: Customer + Event Identification
-  get_baseline_demand()     → Query 2: Pre-event baseline weekly avg (sales signal, 8-week trailing)
-  find_similar_events()     → Query 4: Comparable Event Matching + p25/p50/p75 lift ratios
-  get_product_substitutes() → Query 7: Cannibalization Candidates
-"""
 
-from casci.tools.db import execute_query
+-- ============================================================
+-- Query 1: Customer + Event Identification
+-- Tool: demand_tools.get_event_details(event_id)
+-- Returns: one row per product-location-customer for the event
+-- ============================================================
 
-# ---------------------------------------------------------------------------
-# Paste the SQL from Query 1 here (parameterised on :event_id)
-# ---------------------------------------------------------------------------
-_QUERY_EVENT_DETAILS = """
 SELECT
     e.id                                            AS event_id,
     e.code                                          AS event_code,
@@ -58,13 +62,18 @@ JOIN segment                    seg    ON seg.id                = c.segment_id
 WHERE e.id          = :event_id
   AND e.is_deleted  = 0
 ORDER BY p.code, l.code, c.code
-"""
 
-# ---------------------------------------------------------------------------
-# Query 2 — Pre-event baseline weekly average (8-week trailing, sales signal only)
-# Planned uplift is dropped — scenarios are driven by comparable event actuals (Query 4).
-# ---------------------------------------------------------------------------
-_QUERY_BASELINE_DEMAND = """
+
+-- ============================================================
+-- Query 2: Pre-event Baseline Demand
+-- Tool: demand_tools.get_baseline_demand(event_id)
+-- Returns: single row — baseline_weekly_avg (8-week trailing sales)
+--
+-- Redesigned 2026-05-15: planned uplift dropped entirely.
+-- Scenarios are driven by comparable event actuals (Q4 p25/p50/p75).
+-- Already implemented directly in demand_tools.py — no paste needed.
+-- ============================================================
+
 WITH event_plc AS (
     SELECT plc.id AS plc_id
     FROM event_prod_loc_cust_xref eplcx
@@ -135,12 +144,70 @@ weekly_totals AS (
 )
 SELECT AVG(weekly_total) AS baseline_weekly_avg
 FROM weekly_totals
-"""
 
-# ---------------------------------------------------------------------------
-# Paste the SQL from Query 4 here (parameterised on :event_id)
-# ---------------------------------------------------------------------------
-_QUERY_COMPARABLE_EVENTS = """
+
+-- ============================================================
+-- Query 3: OOS + Overstock + Service Levels
+-- Tool: supply_tools.get_oos_history(event_id)
+-- Source: product_location_xref_history
+-- Returns one row per change record within ±8 week event window
+-- ============================================================
+
+SELECT
+    plc.product_id,
+    plc.location_id,
+    h.StartTime                     AS snapshot_from,
+    h.EndTime                       AS snapshot_to,
+    CASE
+        WHEN h.StartTime < e.start_date THEN 'pre'
+        WHEN h.StartTime > e.end_date   THEN 'post'
+        ELSE 'during'
+    END                             AS promo_window,
+    h.inventory_BOH,
+    h.inventory_onorder,
+    h.inventory_backorder,
+    h.inventory_reserved,
+    h.total_on_hold_quantity,
+    h.inventory_BOH
+        - ISNULL(h.inventory_reserved, 0)
+        + ISNULL(h.inventory_onorder, 0)  AS available_to_promise,
+    h.safety_stock_units,
+    h.system_safety_stock_units,
+    h.buy_safety_stock_units,
+    h.safety_stock_in_effect,
+    h.out_of_stock_point,
+    h.out_of_stock_days,
+    CASE
+        WHEN h.inventory_BOH <= h.out_of_stock_point THEN 1
+        ELSE 0
+    END                             AS is_oos_flag,
+    h.overstock_units,
+    h.overstock_amount,
+    CASE
+        WHEN h.overstock_units > 0 THEN 1
+        ELSE 0
+    END                             AS is_overstock_flag,
+    h.fill_rate_goal,
+    h.fill_rate_goal_el,
+    h.service_level_objective,
+    h.lead_time_days
+FROM dbo.product_location_xref_history h
+JOIN event_prod_loc_cust_xref eplcx ON eplcx.event_id = :event_id
+JOIN product_location_customer_xref plc ON plc.id     = eplcx.prod_loc_cust_id
+JOIN event e ON e.id                                  = :event_id
+  AND h.location_id = plc.location_id
+  AND h.EndTime     >= DATEADD(week, -8, e.start_date)
+  AND h.StartTime   <= DATEADD(week,  6, e.end_date)
+ORDER BY h.StartTime
+
+
+-- ============================================================
+-- Query 4: Comparable Event Matching + Actual Lift Ratios
+-- Tool: demand_tools.find_similar_events(event_id)
+-- Finds past completed events: same product_group + customer segment
+-- Returns p25/p50/p75 lift and confidence tier
+-- ============================================================
+
 WITH anchor AS (
     SELECT DISTINCT
         pg.id    AS product_group_id,
@@ -289,12 +356,127 @@ SELECT
 FROM comp_lift
 WHERE pre_event_baseline > 0
 ORDER BY actual_lift_ratio DESC
-"""
 
-# ---------------------------------------------------------------------------
-# Paste the SQL from Query 7 here (parameterised on :event_id)
-# ---------------------------------------------------------------------------
-_QUERY_SUBSTITUTES = """
+
+-- ============================================================
+-- Query 5: Supply Constraint Snapshot — ATP at T-14
+-- Tool: supply_tools.get_inventory_position(event_id)
+-- Uses history tables to reconstruct state as of T-14
+-- ============================================================
+
+SELECT
+    plc.product_id,
+    plc.location_id,
+    pl_h.inventory_BOH,
+    pl_h.inventory_onorder,
+    pl_h.inventory_reserved,
+    pl_h.inventory_backorder,
+    pl_h.total_on_hold_quantity,
+    pl_h.inventory_BOH
+        - ISNULL(pl_h.inventory_reserved, 0)
+        + ISNULL(pl_h.inventory_onorder,  0)                AS atp,
+    ISNULL(sn_h.quoted_lead_time, pl_h.lead_time_days)      AS lead_time_days,
+    pl_h.lead_time_days                                     AS pl_lead_time_days,
+    sn_h.quoted_lead_time                                   AS sn_quoted_lead_time,
+    sn_h.source_transit_time,
+    sn_h.total_lead_time,
+    psn_h.min_purchase_quantity                             AS moq,
+    psn_h.minimum_order_units,
+    psn_h.maximum_order_units                               AS max_order_qty,
+    psn_h.hard_maximum_units,
+    psn_h.buying_multiple_units,
+    DATEDIFF(day,
+        (SELECT CAST(DATEADD(day, -14, start_date) AS DATE) FROM event WHERE id = :event_id),
+        e.start_date)                                       AS days_until_event,
+    CASE
+        WHEN DATEDIFF(day,
+                (SELECT CAST(DATEADD(day, -14, start_date) AS DATE) FROM event WHERE id = :event_id),
+                e.start_date)
+             >= ISNULL(sn_h.quoted_lead_time, pl_h.lead_time_days)
+        THEN 1 ELSE 0
+    END                                                     AS lead_time_feasible,
+    CASE
+        WHEN DATEDIFF(day,
+                (SELECT CAST(DATEADD(day, -14, start_date) AS DATE) FROM event WHERE id = :event_id),
+                e.start_date)
+             < ISNULL(sn_h.quoted_lead_time, pl_h.lead_time_days)
+        THEN 'ATP only — lead time exceeds remaining window'
+        ELSE 'Pre-stage order feasible'
+    END                                                     AS sourcing_notes,
+    sn.id                                                   AS sourcing_network_id,
+    sn.order_policy
+FROM event e
+JOIN event_prod_loc_cust_xref eplcx ON eplcx.event_id  = e.id
+                                    AND eplcx.is_deleted = 0
+JOIN product_location_customer_xref plc ON plc.id      = eplcx.prod_loc_cust_id
+JOIN dbo.product_location_xref_history pl_h
+    ON  pl_h.product_id  = plc.product_id
+    AND pl_h.location_id = plc.location_id
+    AND pl_h.StartTime  <= (SELECT CAST(DATEADD(day, -14, start_date) AS DATE) FROM event WHERE id = :event_id)
+    AND pl_h.EndTime     > (SELECT CAST(DATEADD(day, -14, start_date) AS DATE) FROM event WHERE id = :event_id)
+LEFT JOIN product_sourcing_network_xref_History psn_h
+    ON  psn_h.product_id = plc.product_id
+    AND psn_h.StartTime <= (SELECT CAST(DATEADD(day, -14, start_date) AS DATE) FROM event WHERE id = :event_id)
+    AND psn_h.EndTime    > (SELECT CAST(DATEADD(day, -14, start_date) AS DATE) FROM event WHERE id = :event_id)
+LEFT JOIN sourcing_network sn
+    ON  sn.id = psn_h.sourcingnetwork_id
+    AND sn.to_location = plc.location_id
+LEFT JOIN dbo.sourcing_network_History sn_h
+    ON  sn_h.id         = sn.id
+    AND sn_h.StartTime <= (SELECT CAST(DATEADD(day, -14, start_date) AS DATE) FROM event WHERE id = :event_id)
+    AND sn_h.EndTime    > (SELECT CAST(DATEADD(day, -14, start_date) AS DATE) FROM event WHERE id = :event_id)
+WHERE e.id = :event_id
+
+
+-- ============================================================
+-- Query 6: Financial Inputs — AS OF T-14
+-- Tool: financial_tools.get_financial_inputs(event_id)
+-- ============================================================
+
+SELECT
+    p.id   AS product_id,
+    p.code AS product_code,
+    l.id   AS location_id,
+    l.code AS location_code,
+    c.id   AS customer_id,
+    c.code AS customer_code,
+    pl_h.current_cost                                       AS unit_cost,
+    pl_h.current_price                                      AS unit_price,
+    pl_h.line_cost,
+    pl_h.carrying_cost                                      AS carrying_cost_rate,
+    pl_h.fill_rate_goal,
+    pl_h.service_level_objective,
+    DATEDIFF(week, e.start_date, e.end_date) + 1           AS event_duration_weeks,
+    cs.min_margin,
+    cs.max_margin,
+    (cs.min_margin + cs.max_margin) / 2.0                  AS customer_margin
+FROM event e
+JOIN event_prod_loc_cust_xref eplcx
+    ON eplcx.event_id = e.id AND eplcx.is_deleted = 0
+JOIN product_location_customer_xref plc
+    ON plc.id = eplcx.prod_loc_cust_id
+JOIN product p   ON p.id  = plc.product_id
+JOIN location l  ON l.id  = plc.location_id
+JOIN customer c  ON c.id  = plc.customer_id
+JOIN customer_segment cs ON cs.id = c.segment_id
+JOIN dbo.product_location_xref_history pl_h
+    ON  pl_h.product_id  = plc.product_id
+    AND pl_h.location_id = plc.location_id
+    AND pl_h.StartTime  <= (SELECT CAST(DATEADD(day, -14, start_date) AS DATE) FROM event WHERE id = :event_id)
+    AND pl_h.EndTime     > (SELECT CAST(DATEADD(day, -14, start_date) AS DATE) FROM event WHERE id = :event_id)
+WHERE e.id = :event_id AND e.is_deleted = 0
+
+
+-- ============================================================
+-- Query 7: Cannibalization Candidates
+-- Tool: demand_tools.get_product_substitutes(event_id)
+-- Returns substitute SKUs in same product_class at same location
+--
+-- DECLARE blocks removed for SQLAlchemy compatibility.
+-- @event_id → :event_id; @pre_weeks hardcoded 8;
+-- @event_start/@event_end/@min_period/@max_period → event_bounds CTE
+-- ============================================================
+
 WITH event_bounds AS (
     SELECT
         e.start_date                  AS event_start,
@@ -418,82 +600,3 @@ SELECT
     END AS cannibalization_factor
 FROM demand_agg
 ORDER BY cannibalization_factor ASC
-"""
-
-
-def get_event_details(event_id: int) -> list[dict]:
-    """Query 1 — Customer + Event Identification.
-
-    Returns one row per product-location-customer combination for the event,
-    including product class/group/family, customer segment, planned uplift,
-    demand, order quantity, and recalc flag.
-    """
-    rows = execute_query(_QUERY_EVENT_DETAILS, {"event_id": event_id})
-    if not rows:
-        raise ValueError(f"No event found for event_id={event_id}")
-    return rows
-
-
-def get_baseline_demand(event_id: int) -> dict:
-    """Query 2 — Pre-event baseline weekly average.
-
-    Averages weekly sales demand across the 8 weeks before the event start,
-    summing across all product-location-customer combinations for the event.
-    Uses demand_signal='sales' only — planned uplift is not used here.
-
-    Returns:
-        baseline_weekly_avg: float — average weekly demand in the 8-week pre-event window
-    """
-    rows = execute_query(_QUERY_BASELINE_DEMAND, {"event_id": event_id})
-    if not rows or rows[0]["baseline_weekly_avg"] is None:
-        raise ValueError(f"No baseline demand found for event_id={event_id}")
-    return {"baseline_weekly_avg": float(rows[0]["baseline_weekly_avg"])}
-
-
-def find_similar_events(event_id: int) -> dict:
-    """Query 4 — Comparable Event Matching + Lift Ratios.
-
-    Three-CTE pipeline: anchor → comparable_events → comp_lift.
-    Pre-computes p25/p50/p75 lift ratios and assigns a confidence tier
-    based on the number of comparable events found.
-
-    Returns:
-        comparables: list[dict] — matched historical events with actuals
-        lift_p25: float — conservative scenario lift (p25)
-        lift_p50: float — moderate scenario lift (p50)
-        lift_p75: float — aggressive scenario lift (p75)
-        confidence_tier: str — "HIGH" | "MEDIUM" | "LOW"
-        comparable_count: int
-    """
-    rows = execute_query(_QUERY_COMPARABLE_EVENTS, {"event_id": event_id})
-
-    if not rows:
-        return {
-            "comparables": [],
-            "lift_p25": 1.5,
-            "lift_p50": 2.0,
-            "lift_p75": 2.5,
-            "confidence_tier": "LOW",
-            "comparable_count": 0,
-        }
-
-    # Query 4 returns aggregate row(s) with percentile columns
-    agg = rows[0]
-    return {
-        "comparables": rows,
-        "lift_p25": float(agg["lift_p25"]),
-        "lift_p50": float(agg["lift_p50"]),
-        "lift_p75": float(agg["lift_p75"]),
-        "confidence_tier": agg["confidence_tier"],
-        "comparable_count": int(agg.get("comparable_count", len(rows))),
-    }
-
-
-def get_product_substitutes(event_id: int) -> list[dict]:
-    """Query 7 — Cannibalization Candidates.
-
-    Identifies substitute SKUs in the same product class at the same location.
-    Returns cannibalization_factor: either -0.20 (default) or actual
-    ratio of during/baseline - 1.0 if historical data exists.
-    """
-    return execute_query(_QUERY_SUBSTITUTES, {"event_id": event_id})
