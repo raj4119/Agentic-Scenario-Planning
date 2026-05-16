@@ -27,11 +27,14 @@ def test_find_similar_events_no_comparables_returns_defaults(mock_query):
 
 
 @patch("casci.tools.demand_tools.execute_query")
-def test_get_baseline_demand_computes_average(mock_query):
-    mock_query.return_value = [
-        {"branch": "actual", "demand": 100.0, "is_baseline_period": True},
-        {"branch": "actual", "demand": 120.0, "is_baseline_period": True},
-        {"branch": "actual", "demand": 110.0, "is_baseline_period": True},
-    ]
+def test_get_baseline_demand_returns_avg(mock_query):
+    mock_query.return_value = [{"baseline_weekly_avg": 110.0}]
     result = get_baseline_demand(event_id=41)
     assert result["baseline_weekly_avg"] == pytest.approx(110.0)
+
+
+@patch("casci.tools.demand_tools.execute_query")
+def test_get_baseline_demand_raises_on_no_data(mock_query):
+    mock_query.return_value = []
+    with pytest.raises(ValueError, match="No baseline demand found"):
+        get_baseline_demand(event_id=99)
